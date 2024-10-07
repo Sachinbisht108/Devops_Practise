@@ -1,0 +1,397 @@
+pipeline {
+    agent { label 'UAT_10.0.11.250' }
+
+    environment {
+        BITBUCKET_USER = 'bistsachin'
+        REPO_URL_FRONTEND = 'bitbucket.org/mmfss/repo_mmfsl_leasing_calc_frontend.git'
+        REPO_URL_BACKEND = 'bitbucket.org/mmfss/repo_mmfsl_leasing_calc_backend.git'
+        SONARQUBE_SERVER = 'sonarqube-leasehub'
+        SONARQUBE_TOKEN = credentials('sonarqube-jenkins-integration')
+    }
+
+    stages {
+        stage('Notify Build Manager') {
+            steps {
+                script {
+                    // Send email for approval
+                    emailext(
+                        subject: "Approval Needed: LeaseHub Deployment Pipeline",
+                        body: """\
+                            <html>
+                            <body>
+                                <p>Dear Build Manager,</p>
+                                <p>The LeaseHub Deployment Pipeline is ready for your approval to start the build process.</p>
+                                <p>Please click the link below to proceed:</p>
+                                <p><a href="${BUILD_URL.tokenize('/')[0..-2].join('/')}">${BUILD_URL.tokenize('/')[0..-2].join('/')}</a></p>
+                                <p>Thank you,<br>Leasehub Jenkins Pipeline</p>
+                            </body>
+                            </html>
+                        """,
+                        to: 'bist.sachin@mahfin.com',
+                        from: 'no-reply-jenkins-pipeline@mahfin.com',
+                        attachLog: false,
+                        mimeType: 'text/html'
+                    )
+
+                    // Await user input for approval and parameters
+                    def userInput = input(
+                        message: 'Do you want to proceed with the deployment?',
+                        ok: 'Proceed',
+                        parameters: [
+                            string(name: 'Tag', defaultValue: '',  description: 'Enter a tag for release. Please find semantic tagging information below for your reference & change.\n\nMajor Releases(X.y.z): Indicate large changes or breaking updates (e.g., v2.0.0).\nMinor Releases(x.Y.z): Add features without affecting compatibility (e.g., v2.1.0).\nPatch Releases(x.y.Z): Fix bugs or apply minor improvements (e.g., v2.1.1).'),
+                            string(name: 'Description for feature', defaultValue: '', description: 'Provide information about the features included in this build.')
+                        ]
+                    )
+
+                    // Store parameters in variables
+                    env.RELEASE_TAG = userInput['Tag']
+                    env.RELEASE_DESCRIPTION = userInput['Description for feature']
+                    echo "Release Tag: ${env.RELEASE_TAG}"
+                    echo "Release Feature Description: ${env.RELEASE_DESCRIPTION}"
+                }
+            }
+        }
+
+        stage('Pull Frontend Code') {
+            steps {
+                dir('/home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_frontend') {
+                    withCredentials([string(credentialsId: 'bitbucket-app-password', variable: 'BITBUCKET_APP_PASSWORD')]) {
+                        sh '''
+                            git pull https://${BITBUCKET_USER}:${BITBUCKET_APP_PASSWORD}@${REPO_URL_FRONTEND} CICDpipelineDeployment
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Pull Backend Code') {
+            steps {
+                dir('/home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_backend') {
+                    withCredentials([string(credentialsId: 'bitbucket-app-password', variable: 'BITBUCKET_APP_PASSWORD')]) {
+                        sh '''
+                            git pull https://${BITBUCKET_USER}:${BITBUCKET_APP_PASSWORD}@${REPO_URL_BACKEND} CICDpipelineDeployment
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Ask for SonarQube Analysis') {
+            steps {
+                script {
+                    def userInput = input(
+                        id: 'userInput',
+                        message: 'Would you like to perform SonarQube scanning?',
+                        parameters: [
+                            choice(name: 'SONAR_SCAN', choices: ['Yes', 'No'], description: 'Perform SonarQube scanning?')
+                        ]
+                    )
+                    
+                    if (userInput == 'Yes') {
+                        env.SONAR_SCAN = 'true'
+                    } else {
+                        env.SONAR_SCAN = 'false'
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Analysis Frontend') {
+            when {
+                environment name: 'SONAR_SCAN', value: 'true'
+            }
+            steps {
+                dir('/home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_frontend') {
+                    script {
+                        def scannerHome = tool 'SonarQube-Scanner'
+                        withSonarQubeEnv(SONARQUBE_SERVER) {
+                            sh "${scannerHome}/bin/sonar-scanner \
+                                -Dsonar.projectKey=leasehub-frontend \
+                                -Dsonar.sources=src \
+                                -Dsonar.host.url=http://10.0.11.250:9000 \
+                                -Dsonar.token=${SONARQUBE_TOKEN}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Analysis Backend') {
+            when {
+                environment name: 'SONAR_SCAN', value: 'true'
+            }
+            steps {
+                dir('/home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_backend') {
+                    script {
+                        def scannerHome = tool 'SonarQube-Scanner'
+                        withSonarQubeEnv(SONARQUBE_SERVER) {
+                            sh "${scannerHome}/bin/sonar-scanner \
+                                -Dsonar.projectKey=leasehub-backend \
+                                -Dsonar.sources=src \
+                                -Dsonar.java.binaries=target/classes \
+                                -Dsonar.host.url=http://10.0.11.250:9000 \
+                                -Dsonar.token=${SONARQUBE_TOKEN}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Frontend') {
+            steps {
+                dir('/home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_frontend') {
+                    sh 'ng build --configuration=production'
+                }
+            }
+        }
+
+        stage('Prepare Frontend') {
+            steps {
+                script {
+                    sh '''
+                        cp -r /home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_frontend/dist/leasehub/browser/* /home/slaveuatadmin/Leasehub_Build/leasehub/
+                    '''
+                }
+            }
+        }
+
+        stage('Zip Frontend') {
+            steps {
+                dir('/home/slaveuatadmin/Leasehub_Build/') {
+                    sh '''
+                        zip -r leasehub.zip leasehub/
+                    '''
+                    stash name: 'frontend_zip', includes: 'leasehub.zip'
+                }
+            }
+        }
+
+        stage('Cleanup Backend Resources') {
+            steps {
+                dir('/home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_backend/src/main/resources/static') {
+                    sh 'rm -rf *'
+                }
+            }
+        }
+
+        stage('Build Backend') {
+            steps {
+                dir('/home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_backend') {
+                    sh 'mvn clean install'
+                    stash name: 'backend_war', includes: 'target/*.war'
+                }
+            }
+        }
+        
+        stage('Copy Attachment') {
+            steps {
+                script {
+                   
+                    sh 'cp /home/slaveuatadmin/Mahindra_LeaseHub_Test/repo_mmfsl_leasing_calc_frontend/tsconfig.json .'
+                }
+            }
+        }
+
+        stage('Approval') {
+            steps {
+                script {
+                    
+                    emailext(
+                        subject: "Approval Needed: LeaseHub Deployment Pipeline",
+                        body: """\
+                            <html>
+                            <body>
+                                <p>Dear Approver,</p>
+                                <p>The LeaseHub Deployment Pipeline is waiting for your approval to proceed to deployment on UAT.</p>
+                                <p><strong>Release Tag:</strong> ${env.RELEASE_TAG}</p>
+                                <p><strong>Feature Description:</strong> ${env.RELEASE_DESCRIPTION}</p>
+                                <p>Please click the link below to proceed:</p>
+                                <p><a href="${BUILD_URL.tokenize('/')[0..-2].join('/')}">${BUILD_URL.tokenize('/')[0..-2].join('/')}</a></p>
+                                <p>Thank you,<br>Leasehub Jenkins Pipeline</p>
+                            </body>
+                            </html>
+                        """,
+                        to: 'jena.snehasish@mahfin.com; bist.sachin@mahfin.com',
+                        from: 'no-reply-jenkins-pipeline@mahfin.com',
+                        attachLog: false,
+                        mimeType: 'text/html',
+                        attachmentsPattern: '*.json' // Attach all JSON files
+                    )
+
+                    // Await user input for approval
+                    input message: 'Do you want to proceed with the deployment?', ok: 'Proceed'
+                }
+            }
+        }
+
+        stage('Notify Release Manager') {
+            steps {
+                script {
+                    // Send email to release manager
+                    emailext(
+                        subject: "Approval provided for deployment of LeaseHub",
+                        body: """\
+                            <html>
+                            <body>
+                                <p>Dear Release Manager,</p>
+                                <p>The LeaseHub Deployment is approved by the stakeholder. Please start the deployment process.</p>
+                                <p>Please click the link below to proceed:</p>
+                                <p><a href="${BUILD_URL.tokenize('/')[0..-2].join('/')}">${BUILD_URL.tokenize('/')[0..-2].join('/')}</a></p>
+                                <p>Thank you,<br>Leasehub Jenkins Pipeline</p>
+                            </body>
+                            </html>
+                        """,
+                        to: 'bist.sachin@mahfin.com',
+                        from: 'no-reply-jenkins-pipeline@mahfin.com',
+                        attachLog: false,
+                        mimeType: 'text/html'
+                    )
+
+                    // Await user input for deployment confirmation
+                    input message: 'Release Manager, do you want to start the deployment?', ok: 'Start Deployment'
+                }
+            }
+        }
+
+        stage('Stop Tomcat Frontend') {
+            agent { label 'UAT_10.0.11.132' }
+            steps {
+                dir('D:\\Jenkins_Slave_Node') {
+                    bat 'stop_tomcat.bat'
+                }
+            }
+        }
+
+        stage('Deploy Frontend') {
+            agent { label 'UAT_10.0.11.132' }
+            steps {
+                dir('D:\\Test_Deployment') {
+                    unstash 'frontend_zip'
+                    bat '''
+                        move /Y leasehub.zip "C:\\Program Files\\Apache Software Foundation\\Tomcat 10.1\\webapps\\leasehub.zip"
+                    '''
+                }
+            }
+        }
+
+        stage('Extract Frontend Build') {
+            agent { label 'UAT_10.0.11.132' }
+            steps {
+                dir('C:\\Program Files\\Apache Software Foundation\\Tomcat 10.1\\webapps') {
+                    bat '''
+                        tar -xvf leasehub.zip
+                    '''
+                }
+            }
+        }
+
+        stage('Stop Tomcat Backend') {
+            agent { label 'UAT_10.0.11.133' }
+            steps {
+                dir('D:\\Jenkins_Slave_Node') {
+                    bat 'stop_tomcat.bat'
+                }
+            }
+        }
+
+        stage('Deploy Backend') {
+            agent { label 'UAT_10.0.11.133' }
+            steps {
+                dir('D:\\Test_Deployment') {
+                    unstash 'backend_war'
+                    bat '''
+                        move target\\leasehub-0.0.1-SNAPSHOT.war "C:\\Program Files\\Apache Software Foundation\\Tomcat 10.1\\webapps\\leasehub.war"
+                        rmdir /S /Q target
+                    '''
+                }
+            }
+        }
+
+        stage('Start Tomcat Frontend') {
+            agent { label 'UAT_10.0.11.132' }
+            steps {
+                build job: 'Start_Tomcat'
+            }
+        }
+
+        stage('Start Tomcat Backend') {
+            agent { label 'UAT_10.0.11.133' }
+            steps {
+                build job: 'Start_Tomcat_133'
+            }
+        }
+
+        stage('Backup Frontend Build') {
+            agent { label 'UAT_10.0.11.132' }
+            steps {
+                script {
+                    // Capture timestamp
+                    def timestamp = bat(script: 'powershell -Command "Get-Date -Format \'yyyy-MM-dd_HH-mm-ss\'"', returnStdout: true).trim().split("\n")[-1]
+                    echo "Captured timestamp: ${timestamp}"
+                    
+                    // Construct backup path
+                    def backupPath = "D:\\Leasehub_Frontend_Build_Backups\\leasehub_${env.RELEASE_TAG}_${timestamp}.zip"
+                    echo "Backup file path: ${backupPath}"
+                    
+                    // Perform the backup with renaming
+                    bat "copy /Y \"C:\\Program Files\\Apache Software Foundation\\Tomcat 10.1\\webapps\\leasehub.zip\" \"${backupPath}\""
+                }
+            }
+        }
+
+        // Backup Backend Build
+        stage('Backup Backend Build') {
+            agent { label 'UAT_10.0.11.133' }
+            steps {
+                script {
+                    def timestamp = bat(script: 'powershell -Command "Get-Date -Format \'yyyy-MM-dd_HH-mm-ss\'"', returnStdout: true).trim().split("\n")[-1]
+                    echo "Captured timestamp: ${timestamp}"
+                    
+                    // Construct backup path
+                    def backupPath = "D:\\Leasehub_Backend_Build_Backups\\leasehub_${env.RELEASE_TAG}_${timestamp}.war"
+                    echo "Backup file path: ${backupPath}"
+                    
+                    // Perform the backup with renaming
+                    bat "copy /Y \"C:\\Program Files\\Apache Software Foundation\\Tomcat 10.1\\webapps\\leasehub.war\" \"${backupPath}\""
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            emailext(
+                subject: "Deployment Successful: LeaseHub CI-CD Pipeline on UAT",
+                body: """\
+                    <html>
+                    <body>
+                        <p>The LeaseHub deployment has completed successfully.</p>
+                        <p>Thank you,<br>Leasehub Jenkins Pipeline</p>
+                    </body>
+                    </html>
+                """,
+                to: 'bist.sachin@mahfin.com',
+                from: 'no-reply-jenkins-pipeline@mahfin.com',
+                attachLog: false,
+                mimeType: 'text/html'
+            )
+        }
+        failure {
+            emailext(
+                subject: "Deployment Failed: LeaseHub CI-CD Pipeline on UAT",
+                body: """\
+                    <html>
+                    <body>
+                        <p>The LeaseHub deployment has failed. Please check the logs for details.</p>
+                        <p>Thank you,<br>Leasehub Jenkins Pipeline</p>
+                    </body>
+                    </html>
+                """,
+                to: 'bist.sachin@mahfin.com',
+                from: 'no-reply-jenkins-pipeline@mahfin.com',
+                attachLog: true,
+                mimeType: 'text/html'
+            )
+        }
+    }
+}
